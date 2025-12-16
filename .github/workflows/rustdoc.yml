@@ -1,0 +1,31 @@
+name: Deploy docs to GitHub Pages
+on:
+  push:
+    branches:
+    - master
+jobs:
+  rustdoc:
+    name: Deploy Documentation
+    runs-on: ubuntu-latest
+    steps:
+    - name: Install dependencies
+      run: sudo apt -y install libglib2.0-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libunwind-dev libnice-dev
+    - name: Check out
+      uses: actions/checkout@v1
+    - name: Install Rust toolchain
+      uses: actions-rs/toolchain@v1
+      with:
+        toolchain: stable
+        profile: minimal
+        override: true
+        components: rustfmt, rust-src
+    - name: Build docs
+      uses: actions-rs/cargo@v1
+      with:
+        command: doc
+        args: --all --no-deps
+    - name: Deploy docs to GitHub Pages
+      uses: peaceiris/actions-gh-pages@v3
+      with:
+        github_token: ${{ secrets.GITHUB_TOKEN }}
+        publish_dir: ./target/doc
