@@ -94,6 +94,9 @@ pub struct JitsiConferenceConfig {
 
   pub buffer_size: u32,
 
+  /// Force all ICE traffic through TURN relay (improves reliability in some network conditions)
+  pub force_relay: bool,
+
   #[cfg(feature = "log-rtp")]
   pub log_rtp: bool,
   #[cfg(feature = "log-rtp")]
@@ -650,6 +653,9 @@ impl StanzaFilter for JitsiConference {
                       .with_from(Jid::Full(self.jid.clone()));
                     self.xmpp_tx.send(result_iq.into()).await?;
 
+                    // Clone jingle before moving it into source_add
+                    let jingle_clone = jingle.clone();
+
                     self
                       .jingle_session
                       .lock()
@@ -658,6 +664,47 @@ impl StanzaFilter for JitsiConference {
                       .context("not connected (no jingle session")?
                       .source_add(jingle)
                       .await?;
+
+                    // Send ReceiverVideoConstraints to subscribe to new participant audio
+                    // This tells JVB we want to receive media from the new endpoint
+                    if let Some(jingle_session) = self.jingle_session.lock().await.as_ref() {
+                      if let Some(colibri_channel) = &jingle_session.colibri_channel {
+                        // Check if this source-add has new participant sources
+                        for content in &jingle_clone.contents {
+                          if let Some(jitsi_xmpp_parsers::jingle::Description::Rtp(desc)) = &content.description {
+                            for ssrc in &desc.ssrcs {
+                              if let Some(info) = &ssrc.info {
+                                let owner = &info.owner;
+                                // owner format: "jvb" or "endpoint_id" or "room@muc/endpoint_id"
+                                if owner != "jvb" {
+                                  let endpoint_id = if owner.contains('/') {
+                                    owner.split('/').nth(1).unwrap_or(owner)
+                                  } else {
+                                    owner
+                                  };
+                                  debug!("Sending ReceiverVideoConstraints for new endpoint: {}", endpoint_id);
+                                  // Audio-only recorder: lastN=0 → JVB forwards no video for
+                                  // this endpoint. Audio is always forwarded regardless of lastN.
+                                  if let Err(e) = colibri_channel
+                                    .send(colibri::ColibriMessage::ReceiverVideoConstraints {
+                                      last_n: Some(0),
+                                      selected_endpoints: None,
+                                      on_stage_endpoints: None,
+                                      default_constraints: None,
+                                      constraints: None,
+                                    })
+                                    .await
+                                  {
+                                    warn!("Failed to send ReceiverVideoConstraints: {:?}", e);
+                                  }
+                                  break; // Only need to send once per source-add
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
                   }
                 }
                 else {

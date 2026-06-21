@@ -159,6 +159,8 @@ pub(crate) struct JingleSession {
   audio_sink_element: gstreamer::Element,
   video_sink_element: gstreamer::Element,
   pub(crate) remote_ssrc_map: HashMap<u32, Source>,
+  /// Tracks pipeline elements created for each SSRC, to allow cleanup on reconnection
+  pub(crate) ssrc_elements: HashMap<u32, Vec<gstreamer::Element>>,
   _ice_agent: nice::Agent,
   pub(crate) accept_iq_id: Option<String>,
   pub(crate) colibri_url: Option<String>,
@@ -367,6 +369,17 @@ impl JingleSession {
     let ice_agent = nice::Agent::new(&conference.glib_main_context, nice::Compatibility::Rfc5245);
     ice_agent.set_ice_tcp(false);
     ice_agent.set_upnp(false);
+
+    // Enable ICE keepalives to prevent connection timeout
+    // Without this, JVB will disconnect us after a few seconds of no RTP traffic
+    ice_agent.set_keepalive_conncheck(true);
+
+    // Enable force-relay if configured - routes all traffic through TURN relay
+    if conference.config.force_relay {
+      debug!("Enabling force-relay mode for ICE agent");
+      ice_agent.set_force_relay(true);
+    }
+
     let ice_stream_id = ice_agent.add_stream(1);
     let ice_component_id = 1;
 
@@ -846,6 +859,26 @@ impl JingleSession {
 
             debug!("pad added for remote source: {:?}", source);
 
+            // Clean up any existing elements for this SSRC (handles reconnection case)
+            let old_elements = handle.block_on(async {
+              conference
+                .jingle_session
+                .lock()
+                .await
+                .as_mut()
+                .and_then(|session| session.ssrc_elements.remove(&ssrc))
+            });
+            if let Some(elements) = old_elements {
+              debug!("SSRC {} reconnected - cleaning up {} old pipeline elements", ssrc, elements.len());
+              for elem in elements {
+                let _ = elem.set_state(gstreamer::State::Null);
+                let _ = pipeline.remove(&elem);
+              }
+            }
+
+            // Collect elements created for this SSRC so we can clean them up on reconnection
+            let mut ssrc_created_elements: Vec<gstreamer::Element> = Vec::new();
+
             let (maybe_participant_id, maybe_sink_element, maybe_participant_bin) =
               if let Some(participant_id) = source.participant_id {
                 handle.block_on(conference.ensure_participant(&participant_id))?;
@@ -937,6 +970,7 @@ impl JingleSession {
               .add(&depayloader)
               .context("failed to add depayloader to pipeline")?;
             depayloader.sync_state_with_parent()?;
+            ssrc_created_elements.push(depayloader.clone());
             debug!("created depayloader");
             rtpbin
               .link_pads(Some(&pad_name), &depayloader, None)
@@ -949,6 +983,7 @@ impl JingleSession {
               .add(&pre_decoder_queue)
               .context("failed to add queue to pipeline")?;
             pre_decoder_queue.sync_state_with_parent()?;
+            ssrc_created_elements.push(pre_decoder_queue.clone());
             depayloader
               .link(&pre_decoder_queue)
               .context("failed to link depayloader to queue")?;
@@ -991,6 +1026,7 @@ impl JingleSession {
               .add(&decoder)
               .context("failed to add decoder to pipeline")?;
             decoder.sync_state_with_parent()?;
+            ssrc_created_elements.push(decoder.clone());
             pre_decoder_queue
               .link(&decoder)
               .context("failed to link queue to decoder")?;
@@ -1000,6 +1036,7 @@ impl JingleSession {
               .add(&post_decoder_queue)
               .context("failed to add queue to pipeline")?;
             post_decoder_queue.sync_state_with_parent()?;
+            ssrc_created_elements.push(post_decoder_queue.clone());
             decoder
               .link(&post_decoder_queue)
               .context("failed to link decoder to queue")?;
@@ -1014,6 +1051,7 @@ impl JingleSession {
                   .add(&videoscale)
                   .context("failed to add videoscale to pipeline")?;
                 videoscale.sync_state_with_parent()?;
+                ssrc_created_elements.push(videoscale.clone());
                 post_decoder_queue
                   .link(&videoscale)
                   .context("failed to link queue to videoscale")?;
@@ -1031,6 +1069,7 @@ impl JingleSession {
                   .add(&capsfilter)
                   .context("failed to add capsfilter to pipeline")?;
                 capsfilter.sync_state_with_parent()?;
+                ssrc_created_elements.push(capsfilter.clone());
                 videoscale
                   .link(&capsfilter)
                   .context("failed to link videoscale to capsfilter")?;
@@ -1040,6 +1079,7 @@ impl JingleSession {
                   .add(&videoconvert)
                   .context("failed to add videoconvert to pipeline")?;
                 videoconvert.sync_state_with_parent()?;
+                ssrc_created_elements.push(videoconvert.clone());
                 capsfilter
                   .link(&videoconvert)
                   .context("failed to link capsfilter to videoconvert")?;
@@ -1049,6 +1089,7 @@ impl JingleSession {
                   .add(&post_videoconvert_queue)
                   .context("failed to add queue to pipeline")?;
                 post_videoconvert_queue.sync_state_with_parent()?;
+                ssrc_created_elements.push(post_videoconvert_queue.clone());
                 videoconvert
                   .link(&post_videoconvert_queue)
                   .context("failed to link videoconvert to queue")?;
@@ -1104,6 +1145,16 @@ impl JingleSession {
                   sink_pad_name, participant_id
                 );
               }
+            }
+
+            // Store the created elements for this SSRC so we can clean them up if the stream reconnects
+            if !ssrc_created_elements.is_empty() {
+              handle.block_on(async {
+                if let Some(session) = conference.jingle_session.lock().await.as_mut() {
+                  debug!("Storing {} pipeline elements for SSRC {}", ssrc_created_elements.len(), ssrc);
+                  session.ssrc_elements.insert(ssrc, ssrc_created_elements);
+                }
+              });
             }
 
             pipeline.debug_to_dot_file(
@@ -1526,6 +1577,7 @@ impl JingleSession {
       audio_sink_element,
       video_sink_element,
       remote_ssrc_map,
+      ssrc_elements: HashMap::new(),
       _ice_agent: ice_agent,
       accept_iq_id: Some(accept_iq_id),
       colibri_url: ice_transport.web_sockets.first().cloned().map(|ws| ws.url),

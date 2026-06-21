@@ -139,6 +139,12 @@ struct Opt {
   #[structopt(short, long, parse(from_occurrences))]
   verbose: u8,
 
+  #[structopt(
+    long,
+    help = "Force all ICE traffic through TURN relay. Useful when direct connectivity is unreliable."
+  )]
+  force_relay: bool,
+
   #[cfg(feature = "tls-insecure")]
   #[structopt(
     long,
@@ -306,12 +312,17 @@ async fn main_inner() -> Result<()> {
     buffer_size,
     start_bitrate,
     stereo,
+    force_relay,
     #[cfg(feature = "log-rtp")]
     log_rtp,
     #[cfg(feature = "log-rtp")]
     log_rtcp,
     ..
   } = opt;
+
+  if force_relay {
+    info!("Force relay mode enabled - all ICE traffic will use TURN relay");
+  }
 
   let config = JitsiConferenceConfig {
     muc: room_jid.parse()?,
@@ -325,6 +336,7 @@ async fn main_inner() -> Result<()> {
     recv_video_scale_height,
     recv_video_scale_width,
     buffer_size,
+    force_relay,
     #[cfg(feature = "log-rtp")]
     log_rtp,
     #[cfg(feature = "log-rtp")]
@@ -343,7 +355,7 @@ async fn main_inner() -> Result<()> {
 
   conference
     .send_colibri_message(ColibriMessage::ReceiverVideoConstraints {
-      last_n: Some(opt.last_n.map(i32::from).unwrap_or(-1)),
+      last_n: Some(opt.last_n.map(i32::from).unwrap_or(0)),
       selected_endpoints: opt
         .select_endpoints
         .map(|endpoints| endpoints.split(',').map(ToOwned::to_owned).collect()),
@@ -390,7 +402,9 @@ async fn main_inner() -> Result<()> {
     }
   }
   else {
-    conference.set_muted(MediaType::Audio, true).await?;
+    // For receive-only mode (no send_pipeline), we do NOT mute audio.
+    // Setting audiomuted=true can cause JVB to not forward audio to us.
+    // We only mute video since we're not sending video.
     conference.set_muted(MediaType::Video, true).await?;
   }
 
